@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# C++ Build
+driver/build/
+driver/baseclasses/
+*.obj
+*.lib
+*.pdb
+*.exp
+
+# IDEs
+.vscode/
+.vs/

@@ -1,0 +1,380 @@
+"""
+receiver/main.py — CamNet Receiver entry point (Windows primary PC).
+
+Orchestrates:
+- mDNS discovery of sender devices
+- SRT stream ingest + decode
+- Shared memory writer (feeds DirectShow filter)
+- REST API for driver communication
+- System tray GUI for user control
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+
+import click
+from loguru import logger
+
+# Configure loguru
+logger.remove()
+logger.add(
+    sys.stderr,
+    format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
+    level="INFO",
+    colorize=True,
+)
+logger.add(
+    Path(__file__).parent / "logs" / "receiver_{time:YYYY-MM-DD}.log",
+    rotation="10 MB",
+    retention="7 days",
+    level="DEBUG",
+)
+
+
+class CamNetReceiver:
+    """
+    Top-level orchestrator for the CamNet Receiver.
+
+    Lifecycle:
+    1. Start REST controller → DirectShow filter can query /shm_info
+    2. Start mDNS discovery → detect sender devices on LAN
+    3. Auto-connect to first discovered device (or wait for manual connect)
+    4. Start ingest pipeline → decode SRT stream into SHM
+    5. DirectShow filter reads SHM → OBS sees live video
+    """
+
+    def __init__(
+        self,
+        auto_connect: bool = True,
+        srt_port: int = 9000,
+        no_tray: bool = False,
+        verbose: bool = False,
+    ) -> None:
+        self.auto_connect = auto_connect
+        self.srt_port = srt_port
+        self.no_tray = no_tray
+
+        self._stop_event = threading.Event()
+        self._running = False
+
+        # Import here so errors are surfaced at startup
+        from controller import ReceiverState, ReceiverController
+        from discovery import CamNetDiscovery
+        from ingest import StreamIngestor
+        from shm_writer import ShmFrameWriter
+
+        self._state = ReceiverState()
+        self._controller = ReceiverController(self._state)
+        self._discovery = CamNetDiscovery()
+        self._ingestor: StreamIngestor | None = None
+        self._shm_writer: ShmFrameWriter | None = None
+        self._tray = None
+
+        self._pump_thread: threading.Thread | None = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start all receiver components."""
+        logger.info("CamNet Receiver starting...")
+        self._state.start_time = time.time()
+
+        # 1. REST API (DirectShow filter needs this immediately)
+        self._controller.on_connect_request(self._handle_connect)
+        self._controller.on_disconnect_request(self._handle_disconnect)
+        self._controller.set_devices_list_fn(self._get_devices_list)
+        self._controller.start()
+
+        # 2. Shared memory (open before discovery so filter can map it)
+        from shm_writer import ShmFrameWriter
+        self._shm_writer = ShmFrameWriter(width=1920, height=1080, fps=60, has_audio=True)
+        self._shm_writer.open()
+        logger.info("Shared memory mapped: {}", self._state.shm_name)
+
+        # 3. mDNS discovery
+        self._discovery.on_device_found(self._on_device_found)
+        self._discovery.on_device_lost(self._on_device_lost)
+        self._discovery.start()
+
+        self._running = True
+        logger.success(
+            "CamNet Receiver ready!\n"
+            "  REST API:     http://localhost:7432/\n"
+            "  Shared Mem:   {}\n"
+            "  Waiting for sender devices on LAN...",
+            self._state.shm_name,
+        )
+
+        # 4. System tray
+        if not self.no_tray:
+            self._start_tray()
+
+    def stop(self) -> None:
+        """Stop all components gracefully."""
+        logger.info("CamNet Receiver shutting down...")
+        self._running = False
+
+        self._handle_disconnect()
+
+        self._discovery.stop()
+
+        if self._shm_writer:
+            self._shm_writer.close()
+
+        self._stop_event.set()
+        logger.success("CamNet Receiver stopped.")
+
+    def wait(self) -> None:
+        """Block until stop() is called."""
+        try:
+            self._stop_event.wait()
+        except KeyboardInterrupt:
+            self.stop()
+
+    # ------------------------------------------------------------------
+    # Device event handlers
+    # ------------------------------------------------------------------
+
+    def _on_device_found(self, device) -> None:
+        logger.success(
+            "📷 Sender discovered: {} @ {}:{} | {}@{}fps | audio={}",
+            device.name, device.ip, device.port,
+            device.resolution, device.fps, device.has_audio,
+        )
+        if self.auto_connect and not self._state.connected:
+            logger.info("Auto-connecting to {}...", device.name)
+            self._handle_connect(
+                ip=device.ip,
+                port=device.port,
+                device_name=device.name,
+            )
+
+    def _on_device_lost(self, device) -> None:
+        logger.warning("📷 Sender lost: {}", device.name)
+        if self._state.connected and self._state.sender_name == device.name:
+            logger.warning("Active stream device lost — waiting for reconnect...")
+            # Ingestor handles reconnection internally via backoff
+
+    # ------------------------------------------------------------------
+    # Connect / Disconnect
+    # ------------------------------------------------------------------
+
+    def _handle_connect(self, ip: str, port: int, device_name: str = "") -> None:
+        """Connect to a specific sender device."""
+        if self._state.connected:
+            logger.info("Already connected — disconnecting first.")
+            self._handle_disconnect()
+
+        from ingest import StreamIngestor
+        logger.info("Connecting to SRT stream at {}:{}...", ip, port)
+
+        self._ingestor = StreamIngestor(ip=ip, port=port, fps=60, has_audio=True)
+        self._ingestor.start()
+
+        self._state.connected = True
+        self._state.sender_ip = ip
+        self._state.sender_port = port
+        self._state.sender_name = device_name
+        self._state.resolution = "1920x1080"
+        self._state.fps = 60
+        self._state.has_audio = True
+
+        # Start the frame pump thread
+        self._pump_thread = threading.Thread(
+            target=self._frame_pump_loop,
+            name="CamNetFramePump",
+            daemon=True,
+        )
+        self._pump_thread.start()
+        logger.success("Connected to {} ({}:{}).", device_name, ip, port)
+
+    def _handle_disconnect(self) -> None:
+        """Disconnect from the current stream."""
+        if self._ingestor:
+            self._ingestor.stop()
+            self._ingestor = None
+
+        self._state.connected = False
+        self._state.sender_ip = ""
+        self._state.sender_port = 0
+        self._state.sender_name = ""
+        logger.info("Disconnected from stream.")
+
+    # ------------------------------------------------------------------
+    # Frame pump loop
+    # ------------------------------------------------------------------
+
+    def _frame_pump_loop(self) -> None:
+        """
+        Continuously reads decoded frames from the ingestor and writes
+        them into shared memory for the DirectShow filter.
+        """
+        logger.info("Frame pump started.")
+        ingestor = self._ingestor
+        shm = self._shm_writer
+
+        while self._running and self._state.connected:
+            try:
+                # Blocking get with short timeout
+                try:
+                    video_frame = ingestor.video_queue.get(timeout=0.5)
+                except Exception:
+                    continue
+
+                # Try to get matching audio chunk (non-blocking)
+                audio_chunk = b""
+                try:
+                    audio_chunk = ingestor.audio_queue.get_nowait()
+                except Exception:
+                    pass
+
+                # Write to shared memory
+                write_start = time.perf_counter()
+                shm.write_frame(video_frame, audio_chunk)
+                write_ms = (time.perf_counter() - write_start) * 1000
+
+                # Update stats
+                self._state.frames_received += 1
+                self._state.latency_ms = write_ms
+
+                if self._state.frames_received % 300 == 0:
+                    logger.debug(
+                        "Pump: {} frames | write={:.2f}ms | dropped={}",
+                        self._state.frames_received,
+                        write_ms,
+                        ingestor.stats.frames_dropped,
+                    )
+
+            except Exception as exc:
+                logger.error("Frame pump error: {}", exc)
+                time.sleep(0.1)
+
+        logger.info("Frame pump exited.")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_devices_list(self) -> list[dict]:
+        """Return discovered devices as JSON-serializable list."""
+        from dataclasses import asdict
+        return [
+            {
+                "name": d.name,
+                "ip": d.ip,
+                "port": d.port,
+                "resolution": d.resolution,
+                "fps": d.fps,
+                "has_audio": d.has_audio,
+                "last_seen": d.last_seen,
+            }
+            for d in self._discovery.get_devices()
+        ]
+
+    def _start_tray(self) -> None:
+        """Launch system tray icon."""
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            def make_icon(connected: bool = False) -> Image.Image:
+                img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+                d = ImageDraw.Draw(img)
+                color = (0, 200, 80) if connected else (220, 80, 40)
+                # Monitor shape
+                d.rectangle([4, 8, 60, 46], fill=(30, 30, 60), outline=color, width=3)
+                # Screen content indicator
+                d.rectangle([10, 14, 54, 40], fill=color)
+                # Stand
+                d.rectangle([24, 46, 40, 52], fill=(30, 30, 60))
+                d.rectangle([16, 52, 48, 56], fill=(30, 30, 60))
+                return img
+
+            state = self._state
+
+            def on_quit(icon, _):
+                icon.stop()
+                self.stop()
+
+            def on_connect(icon, _):
+                devices = self._discovery.get_devices()
+                if devices:
+                    d = devices[0]
+                    self._handle_connect(d.ip, d.port, d.name)
+                else:
+                    logger.warning("No devices discovered yet.")
+
+            def on_disconnect(icon, _):
+                self._handle_disconnect()
+
+            icon = pystray.Icon(
+                "CamNet Receiver",
+                make_icon(False),
+                "CamNet Receiver",
+                menu=pystray.Menu(
+                    pystray.MenuItem("CamNet Receiver", None, enabled=False),
+                    pystray.MenuItem("Connect to first device", on_connect),
+                    pystray.MenuItem("Disconnect", on_disconnect),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("Open API Dashboard", lambda *_: (
+                        __import__("webbrowser").open("http://localhost:7432/status")
+                    )),
+                    pystray.MenuItem("Quit", on_quit),
+                ),
+            )
+
+            self._tray = icon
+            threading.Thread(
+                target=icon.run,
+                name="CamNetTray",
+                daemon=True,
+            ).start()
+            logger.info("System tray started.")
+
+        except ImportError:
+            logger.warning("pystray/Pillow not available — no system tray.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+@click.command()
+@click.option("--auto-connect/--no-auto-connect", default=True, show_default=True,
+              help="Auto-connect to the first discovered sender.")
+@click.option("--no-tray", is_flag=True, default=False,
+              help="Disable system tray icon.")
+@click.option("--verbose", "-v", is_flag=True, default=False,
+              help="Enable verbose debug logging.")
+def cli(auto_connect: bool, no_tray: bool, verbose: bool) -> None:
+    """CamNet Receiver — connect a network camera to OBS Studio."""
+    if sys.platform != "win32":
+        logger.error("CamNet Receiver requires Windows (DirectShow/Win32 SHM).")
+        sys.exit(1)
+
+    if verbose:
+        logger.remove()
+        logger.add(sys.stderr, level="DEBUG", colorize=True)
+
+    app = CamNetReceiver(auto_connect=auto_connect, no_tray=no_tray)
+
+    def handle_signal(sig, frame):
+        app.stop()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    app.start()
+    app.wait()
+
+
+if __name__ == "__main__":
+    cli()

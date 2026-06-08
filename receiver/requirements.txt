@@ -1,0 +1,29 @@
+# CamNet Receiver — Python Dependencies (Windows)
+# Install: pip install -r requirements.txt
+
+# mDNS / ZeroConf discovery
+zeroconf>=0.132.2
+
+# SRT stream ingest via ffmpeg subprocess + bindings
+ffmpeg-python>=0.2.0
+
+# GUI / system tray
+pystray>=0.19.5
+Pillow>=10.3.0
+tkinter-tooltip>=2.1.0  # optional tooltip helper
+
+# REST API for driver <-> receiver IPC
+flask>=3.0.3
+flask-cors>=4.0.1
+
+# Shared memory + Win32 IPC
+pywin32>=306
+
+# Metrics and monitoring
+prometheus-client>=0.20.0
+
+# Utilities
+click>=8.1.7
+loguru>=0.7.2
+psutil>=5.9.8
+requests>=2.32.3

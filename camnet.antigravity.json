@@ -1,0 +1,153 @@
+{
+  "project": "camnet",
+  "display_name": "CamNet — Network Camera to OBS Virtual Source",
+  "description": "Cross-platform system that streams any LAN camera (phone, secondary PC) into OBS Studio as a native DirectShow Virtual Camera device. No browser source required.",
+  "version": "0.1.0",
+  "root": "c:\\Users\\kyleh\\Desktop\\camnet",
+
+  "workspace": {
+    "folders": [
+      { "path": ".", "name": "CamNet Root" },
+      { "path": "sender",           "name": "Sender (Python)" },
+      { "path": "receiver",         "name": "Receiver (Python)" },
+      { "path": "driver",           "name": "Virtual Camera Driver (C++)" },
+      { "path": "driver_installer", "name": "Driver Installer (Python)" },
+      { "path": "tests",            "name": "Test Suite" }
+    ]
+  },
+
+  "run_targets": [
+    {
+      "id": "receiver",
+      "label": "▶ Start Receiver (Primary PC)",
+      "command": "py receiver/main.py",
+      "cwd": ".",
+      "description": "Auto-discovers sender on LAN, ingests SRT stream, writes frames to shared memory"
+    },
+    {
+      "id": "sender",
+      "label": "▶ Start Sender (Secondary PC)",
+      "command": "py sender/main.py --device 0 --fps 60",
+      "cwd": ".",
+      "description": "Captures camera, encodes H.264+AAC, streams via SRT, announces via mDNS"
+    },
+    {
+      "id": "sender-verbose",
+      "label": "▶ Start Sender (verbose)",
+      "command": "py sender/main.py --device 0 --fps 60 --verbose",
+      "cwd": ".",
+      "description": "Sender with debug logging enabled"
+    },
+    {
+      "id": "install-driver",
+      "label": "🔧 Install Virtual Camera Driver",
+      "command": "py driver_installer/install.py --skip-build",
+      "cwd": ".",
+      "description": "Register camnet_vcam.dll as a COM DirectShow filter (requires Administrator)"
+    },
+    {
+      "id": "uninstall-driver",
+      "label": "🗑️ Uninstall Virtual Camera Driver",
+      "command": "py driver_installer/uninstall.py",
+      "cwd": ".",
+      "description": "Unregister and remove the DirectShow filter"
+    },
+    {
+      "id": "build-driver",
+      "label": "⚙️ Build C++ Driver (CMake)",
+      "command": "cmake -B driver/build -G \"Visual Studio 17 2022\" -A x64 && cmake --build driver/build --config Release",
+      "cwd": ".",
+      "description": "Compile camnet_vcam.dll from source using MSVC"
+    },
+    {
+      "id": "test-all",
+      "label": "🧪 Run All Tests",
+      "command": "py -m pytest tests/ -v --tb=short",
+      "cwd": ".",
+      "description": "Full test suite: discovery, SHM integrity, latency benchmarks"
+    },
+    {
+      "id": "test-discovery",
+      "label": "🧪 Test Discovery Only",
+      "command": "py -m pytest tests/test_discovery.py -v",
+      "cwd": ".",
+      "description": "mDNS announce/browse round-trip tests"
+    },
+    {
+      "id": "test-latency",
+      "label": "📊 Latency Benchmark",
+      "command": "py -m pytest tests/test_latency.py -v -s",
+      "cwd": ".",
+      "description": "SHM write latency p50/p99 + 60fps throughput verification"
+    },
+    {
+      "id": "api-status",
+      "label": "🌐 Check Receiver API Status",
+      "command": "curl -s http://localhost:7432/status | py -m json.tool",
+      "cwd": ".",
+      "description": "Poll the receiver REST API for live status"
+    },
+    {
+      "id": "install-receiver-deps",
+      "label": "📦 Install Receiver Dependencies",
+      "command": "pip install -r receiver/requirements.txt",
+      "cwd": ".",
+      "description": "Install Python packages for receiver"
+    },
+    {
+      "id": "install-sender-deps",
+      "label": "📦 Install Sender Dependencies",
+      "command": "pip install -r sender/requirements.txt",
+      "cwd": ".",
+      "description": "Install Python packages for sender"
+    }
+  ],
+
+  "debug_targets": [
+    {
+      "id": "debug-receiver",
+      "label": "🐛 Debug Receiver",
+      "command": "py -u receiver/main.py --verbose",
+      "cwd": ".",
+      "description": "Run receiver with verbose output and unbuffered stdout"
+    },
+    {
+      "id": "debug-sender",
+      "label": "🐛 Debug Sender",
+      "command": "py -u sender/main.py --device 0 --fps 60 --no-tray --verbose",
+      "cwd": ".",
+      "description": "Run sender without tray (foreground) with debug logging"
+    },
+    {
+      "id": "debug-shm",
+      "label": "🐛 Debug SHM Writer",
+      "command": "py receiver/shm_writer.py",
+      "cwd": ".",
+      "description": "Run SHM writer self-test (writes 100 synthetic frames)"
+    }
+  ],
+
+  "environment": {
+    "python": "py",
+    "requires_admin_for": ["install-driver", "uninstall-driver", "build-driver"],
+    "platform": "win32",
+    "min_python_version": "3.11",
+    "external_tools": ["ffmpeg", "cmake", "regsvr32"]
+  },
+
+  "agent_hints": {
+    "primary_language": "Python",
+    "secondary_language": "C++",
+    "key_entry_points": [
+      "sender/main.py",
+      "receiver/main.py",
+      "driver_installer/install.py"
+    ],
+    "ipc_mechanism": "Win32 Named Shared Memory (Global\\CamNetFrame) + Named Mutex (Global\\CamNetMutex)",
+    "streaming_protocol": "SRT (primary), WebRTC (fallback)",
+    "codec": "H.264 zerolatency + AAC 48kHz",
+    "obs_integration": "DirectShow CSource filter — CLSID {B5C7E300-6D41-4A8E-9F12-3C4D5E6F7A8B}",
+    "rest_api": "http://localhost:7432/",
+    "discovery": "mDNS _camnet._tcp.local."
+  }
+}

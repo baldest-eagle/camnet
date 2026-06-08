@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>CamNet — Mobile Sender</title>
+    <meta name="description" content="CamNet mobile camera sender — stream your phone camera to OBS Studio">
+    <style>
+        /* ----------------------------------------------------------------
+           Design system — dark glass aesthetic
+           ---------------------------------------------------------------- */
+        :root {
+            --accent:       #4F8EF7;
+            --accent-glow:  rgba(79, 142, 247, 0.35);
+            --green:        #3DD68C;
+            --red:          #F7604F;
+            --yellow:       #F7C24F;
+            --bg:           #0A0C14;
+            --surface:      rgba(255,255,255,0.05);
+            --border:       rgba(255,255,255,0.10);
+            --text:         #E8EAF0;
+            --text-dim:     #8A90A0;
+            --radius:       16px;
+            --font:         'Inter', system-ui, sans-serif;
+        }
+
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: var(--font);
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            overflow-x: hidden;
+        }
+
+        /* Background gradient blobs */
+        body::before {
+            content: '';
+            position: fixed;
+            top: -30%;
+            left: -20%;
+            width: 60vw;
+            height: 60vw;
+            background: radial-gradient(circle, rgba(79,142,247,0.12) 0%, transparent 70%);
+            pointer-events: none;
+            z-index: 0;
+        }
+        body::after {
+            content: '';
+            position: fixed;
+            bottom: -20%;
+            right: -15%;
+            width: 50vw;
+            height: 50vw;
+            background: radial-gradient(circle, rgba(61,214,140,0.08) 0%, transparent 70%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 480px;
+            padding: 24px 20px 40px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* --- Header --- */
+        header {
+            text-align: center;
+            padding: 12px 0 4px;
+        }
+        .logo {
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            background: linear-gradient(135deg, var(--accent), var(--green));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .tagline {
+            font-size: 13px;
+            color: var(--text-dim);
+            margin-top: 4px;
+        }
+
+        /* --- Glass card --- */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            backdrop-filter: blur(20px);
+        }
+
+        .card-title {
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--text-dim);
+            margin-bottom: 14px;
+        }
+
+        /* --- Status indicator --- */
+        .status-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            background: var(--text-dim);
+            transition: background 0.3s;
+        }
+        .dot.green { background: var(--green); box-shadow: 0 0 8px var(--green); }
+        .dot.yellow { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+        .dot.red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+        .status-text { font-size: 14px; font-weight: 500; }
+        .status-detail { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+        /* --- Video preview --- */
+        #videoPreview {
+            width: 100%;
+            aspect-ratio: 16/9;
+            border-radius: 12px;
+            background: #0E1020;
+            object-fit: cover;
+            display: block;
+            border: 1px solid var(--border);
+        }
+        .preview-placeholder {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            aspect-ratio: 16/9;
+            border-radius: 12px;
+            border: 2px dashed var(--border);
+            color: var(--text-dim);
+            font-size: 13px;
+            gap: 8px;
+        }
+
+        /* --- Controls --- */
+        .controls { display: flex; flex-direction: column; gap: 12px; }
+
+        label {
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-dim);
+            display: block;
+            margin-bottom: 6px;
+        }
+
+        select, input[type="text"], input[type="number"] {
+            width: 100%;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text);
+            font-family: var(--font);
+            font-size: 14px;
+            padding: 11px 14px;
+            outline: none;
+            transition: border-color 0.2s;
+            appearance: none;
+        }
+        select:focus, input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+        /* --- Buttons --- */
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border-radius: 12px;
+            border: none;
+            font-family: var(--font);
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            letter-spacing: 0.01em;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent), #3A6FD8);
+            color: #fff;
+            box-shadow: 0 4px 20px rgba(79,142,247,0.35);
+        }
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 28px rgba(79,142,247,0.45);
+        }
+        .btn-primary:active:not(:disabled) { transform: translateY(0); }
+        .btn-danger {
+            background: rgba(247,96,79,0.15);
+            color: var(--red);
+            border: 1px solid rgba(247,96,79,0.3);
+        }
+        .btn-danger:hover:not(:disabled) {
+            background: rgba(247,96,79,0.25);
+        }
+        .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+        /* --- Stats grid --- */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+        .stat-cell {
+            background: rgba(0,0,0,0.25);
+            border-radius: 10px;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+        }
+        .stat-label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+        .stat-value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        .stat-value.green { color: var(--green); }
+        .stat-value.yellow { color: var(--yellow); }
+
+        /* --- Log console --- */
+        #logConsole {
+            background: rgba(0,0,0,0.4);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 11px;
+            line-height: 1.6;
+            padding: 12px;
+            max-height: 140px;
+            overflow-y: auto;
+            color: #8AA0C0;
+        }
+        .log-line { margin-bottom: 2px; }
+        .log-info { color: #6EA8D0; }
+        .log-ok   { color: var(--green); }
+        .log-warn { color: var(--yellow); }
+        .log-err  { color: var(--red); }
+
+        /* --- Flip camera button --- */
+        .flip-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.5);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            padding: 8px 10px;
+            cursor: pointer;
+            font-size: 18px;
+            backdrop-filter: blur(10px);
+            transition: background 0.2s;
+        }
+        .flip-btn:hover { background: rgba(255,255,255,0.1); }
+        .preview-wrap { position: relative; }
+
+        /* Pulse animation for "live" indicator */
+        @keyframes pulse {
+            0%,100% { opacity: 1; }
+            50%       { opacity: 0.4; }
+        }
+        .live-badge {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: var(--red);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            padding: 4px 10px;
+            border-radius: 6px;
+            animation: pulse 1.5s ease-in-out infinite;
+            display: none;
+        }
+        .live-badge.visible { display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <div class="logo">📡 CamNet</div>
+            <div class="tagline">Mobile Camera Sender</div>
+        </header>
+
+        <!-- Status Card -->
+        <div class="card" id="statusCard">
+            <div class="card-title">Connection Status</div>
+            <div class="status-row">
+                <div class="dot" id="statusDot"></div>
+                <div>
+                    <div class="status-text" id="statusText">Not connected</div>
+                    <div class="status-detail" id="statusDetail">Configure receiver IP and press Start</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Video Preview -->
+        <div class="card">
+            <div class="card-title">Camera Preview</div>
+            <div class="preview-wrap" id="previewWrap">
+                <video id="videoPreview" autoplay muted playsinline style="display:none;"></video>
+                <div class="preview-placeholder" id="previewPlaceholder">
+                    <span>📷</span>
+                    <span>Camera preview will appear here</span>
+                </div>
+                <div class="live-badge" id="liveBadge">● LIVE</div>
+                <button class="flip-btn" id="flipBtn" title="Flip camera">⟳</button>
+            </div>
+        </div>
+
+        <!-- Configuration -->
+        <div class="card controls">
+            <div class="card-title">Settings</div>
+
+            <div>
+                <label for="receiverIp">Receiver IP Address</label>
+                <input type="text" id="receiverIp" placeholder="e.g. 192.168.1.100"
+                       autocomplete="off" autocorrect="off" spellcheck="false">
+            </div>
+
+            <div class="row2">
+                <div>
+                    <label for="receiverPort">Port</label>
+                    <input type="number" id="receiverPort" value="8080" min="1024" max="65535">
+                </div>
+                <div>
+                    <label for="cameraFacing">Camera</label>
+                    <select id="cameraFacing">
+                        <option value="user">Front</option>
+                        <option value="environment" selected>Rear</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="row2">
+                <div>
+                    <label for="resolution">Resolution</label>
+                    <select id="resolution">
+                        <option value="1920x1080" selected>1080p</option>
+                        <option value="1280x720">720p</option>
+                        <option value="3840x2160">4K</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="targetFps">Frame Rate</label>
+                    <select id="targetFps">
+                        <option value="60" selected>60 fps</option>
+                        <option value="30">30 fps</option>
+                        <option value="24">24 fps</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <button class="btn btn-primary" id="startBtn">
+            <span>▶</span> Start Streaming
+        </button>
+        <button class="btn btn-danger" id="stopBtn" disabled>
+            <span>■</span> Stop Streaming
+        </button>
+
+        <!-- Stats -->
+        <div class="card" id="statsCard" style="display:none;">
+            <div class="card-title">Live Stats</div>
+            <div class="stats-grid">
+                <div class="stat-cell">
+                    <div class="stat-label">Frames Sent</div>
+                    <div class="stat-value green" id="statFrames">0</div>
+                </div>
+                <div class="stat-cell">
+                    <div class="stat-label">Bitrate</div>
+                    <div class="stat-value" id="statBitrate">—</div>
+                </div>
+                <div class="stat-cell">
+                    <div class="stat-label">RTT</div>
+                    <div class="stat-value yellow" id="statRtt">—</div>
+                </div>
+                <div class="stat-cell">
+                    <div class="stat-label">Lost Packets</div>
+                    <div class="stat-value" id="statLost">0</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Log Console -->
+        <div class="card">
+            <div class="card-title">Log</div>
+            <div id="logConsole"></div>
+        </div>
+    </div>
+
+    <script src="sender.js"></script>
+</body>
+</html>

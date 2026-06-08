@@ -1,0 +1,1 @@
+# CamNet tests package
