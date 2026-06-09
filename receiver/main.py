@@ -17,6 +17,10 @@ import sys
 import threading
 import time
 from pathlib import Path
+# Ensure the project root is on sys.path so `from receiver.xxx` imports work
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import click
 from loguru import logger
@@ -53,21 +57,26 @@ class CamNetReceiver:
         self,
         auto_connect: bool = True,
         srt_port: int = 9000,
+        width: int = 1920,
+        height: int = 1080,
+        fps: int = 60,
         no_tray: bool = False,
-        verbose: bool = False,
     ) -> None:
         self.auto_connect = auto_connect
         self.srt_port = srt_port
+        self.width = width
+        self.height = height
+        self.fps = fps
         self.no_tray = no_tray
 
         self._stop_event = threading.Event()
         self._running = False
 
         # Import here so errors are surfaced at startup
-        from controller import ReceiverState, ReceiverController
-        from discovery import CamNetDiscovery
-        from ingest import StreamIngestor
-        from shm_writer import ShmFrameWriter
+        from receiver.controller import ReceiverState, ReceiverController
+        from receiver.discovery import CamNetDiscovery
+        from receiver.ingest import StreamIngestor
+        from receiver.shm_writer import ShmFrameWriter
 
         self._state = ReceiverState()
         self._controller = ReceiverController(self._state)
@@ -94,8 +103,8 @@ class CamNetReceiver:
         self._controller.start()
 
         # 2. Shared memory (open before discovery so filter can map it)
-        from shm_writer import ShmFrameWriter
-        self._shm_writer = ShmFrameWriter(width=1920, height=1080, fps=60, has_audio=True)
+        from receiver.shm_writer import ShmFrameWriter
+        self._shm_writer = ShmFrameWriter(width=self.width, height=self.height, fps=self.fps, has_audio=True)
         self._shm_writer.open()
         logger.info("Shared memory mapped: {}", self._state.shm_name)
 
@@ -173,18 +182,18 @@ class CamNetReceiver:
             logger.info("Already connected — disconnecting first.")
             self._handle_disconnect()
 
-        from ingest import StreamIngestor
+        from receiver.ingest import StreamIngestor
         logger.info("Connecting to SRT stream at {}:{}...", ip, port)
 
-        self._ingestor = StreamIngestor(ip=ip, port=port, fps=60, has_audio=True)
+        self._ingestor = StreamIngestor(ip=ip, port=port, fps=self.fps, has_audio=True)
         self._ingestor.start()
 
         self._state.connected = True
         self._state.sender_ip = ip
         self._state.sender_port = port
         self._state.sender_name = device_name
-        self._state.resolution = "1920x1080"
-        self._state.fps = 60
+        self._state.resolution = f"{self.width}x{self.height}"
+        self._state.fps = self.fps
         self._state.has_audio = True
 
         # Start the frame pump thread
@@ -350,11 +359,16 @@ class CamNetReceiver:
 @click.command()
 @click.option("--auto-connect/--no-auto-connect", default=True, show_default=True,
               help="Auto-connect to the first discovered sender.")
+@click.option("--resolution", "-r", default="1920x1080", show_default=True,
+              callback=lambda ctx, param, v: tuple(int(x) for x in v.lower().split("x")),
+              help="Capture resolution WxH.")
+@click.option("--fps", "-f", default=60, type=int, show_default=True,
+              help="Target frame rate.")
 @click.option("--no-tray", is_flag=True, default=False,
               help="Disable system tray icon.")
 @click.option("--verbose", "-v", is_flag=True, default=False,
               help="Enable verbose debug logging.")
-def cli(auto_connect: bool, no_tray: bool, verbose: bool) -> None:
+def cli(auto_connect: bool, resolution: tuple, fps: int, no_tray: bool, verbose: bool) -> None:
     """CamNet Receiver — connect a network camera to OBS Studio."""
     if sys.platform != "win32":
         logger.error("CamNet Receiver requires Windows (DirectShow/Win32 SHM).")
@@ -364,7 +378,8 @@ def cli(auto_connect: bool, no_tray: bool, verbose: bool) -> None:
         logger.remove()
         logger.add(sys.stderr, level="DEBUG", colorize=True)
 
-    app = CamNetReceiver(auto_connect=auto_connect, no_tray=no_tray)
+    width, height = resolution
+    app = CamNetReceiver(auto_connect=auto_connect, width=width, height=height, fps=fps, no_tray=no_tray)
 
     def handle_signal(sig, frame):
         app.stop()

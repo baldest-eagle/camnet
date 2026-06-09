@@ -18,6 +18,12 @@ import threading
 import time
 from pathlib import Path
 
+# Ensure the project root is on sys.path so `from sender.xxx` imports work
+# regardless of the working directory when the script is launched.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import click
 from loguru import logger
 
@@ -81,7 +87,7 @@ class CamNetSender:
         )
 
         # 1. Start SRT streamer (captures camera + streams)
-        from streamer import SRTStreamer, StreamerConfig
+        from sender.streamer import SRTStreamer, StreamerConfig
         stream_config = StreamerConfig(
             srt_port=self.srt_port,
             width=self.width,
@@ -92,7 +98,7 @@ class CamNetSender:
         self._streamer.start()
 
         # 2. Announce via mDNS
-        from discovery import DiscoveryAnnouncer
+        from sender.discovery import DiscoveryAnnouncer
         self._announcer = DiscoveryAnnouncer(
             srt_port=self.srt_port,
             resolution=(self.width, self.height),

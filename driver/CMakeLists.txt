@@ -8,9 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Build configuration
 # ---------------------------------------------------------------------------
 if(NOT MSVC)
-    message(FATAL_ERROR
-        "CamNet DirectShow driver requires MSVC (Visual Studio 2019/2022). "
-        "Run: cmake -G \"Visual Studio 17 2022\" -A x64 .."
+    message(WARNING
+        "CamNet DirectShow driver is designed for MSVC (Visual Studio 2019/2022). "
+        "MinGW builds are not officially supported — strmbase linkage may fail. "
+        "Recommended: cmake -G \"Visual Studio 17 2022\" -A x64 .."
     )
 endif()
 

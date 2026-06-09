@@ -284,19 +284,19 @@ bool CCamNetVCamPin::ReadLatestFrame(BYTE* pDest, DWORD bufSize) {
             __leave;
         }
 
-        // Check frame staleness
-        DWORD nowMs = GetTickCount();
-        uint64_t frameAgeMs = static_cast<uint64_t>(nowMs) -
-                              static_cast<uint64_t>(header->timestamp_ms % UINT32_MAX);
-        // Use frame_index instead for freshness check
+        // Check frame freshness using frame_index to detect stale data.
+        // We also use GetTickCount() to detect if the writer has stopped
+        // producing new frames (e.g. sender disconnected).
         if (header->frame_index == m_lastFrameIndex) {
-            // Same frame as last time — still deliver it (receiver may be slow)
-            // but track time so we can fall back to black if really stale
+            // Same frame as last time — still deliver it so OBS keeps showing
+            // the last known image, but fall back to black if it's been too long.
+            DWORD nowMs = GetTickCount();
             if (nowMs - m_lastFrameTimeMs > CAMNET_FRAME_TIMEOUT_MS * 5) {
                 __leave;  // Too stale — black frame
             }
         } else {
-            m_lastFrameTimeMs = nowMs;
+            // New frame arrived — record when we saw it
+            m_lastFrameTimeMs = GetTickCount();
         }
         m_lastFrameIndex = header->frame_index;
 
@@ -327,14 +327,20 @@ bool CCamNetVCamPin::ReadLatestFrame(BYTE* pDest, DWORD bufSize) {
 
 // --------------------------------------------------------------------------
 // FillBlackFrame — fill the buffer with opaque black BGRA pixels
+//
+// Optimized: uses memset for the bulk fill, then sets alpha channel.
+// BGRA opaque black = {0x00, 0x00, 0x00, 0xFF} per pixel.
+// We zero all bytes (BGR=0) then set every 4th byte (A) to 0xFF.
 // --------------------------------------------------------------------------
 void CCamNetVCamPin::FillBlackFrame(BYTE* pDest, DWORD bufSize) {
-    // BGRA: B=0, G=0, R=0, A=255
-    for (DWORD i = 0; i < bufSize; i += 4) {
-        pDest[i + 0] = 0;    // B
-        pDest[i + 1] = 0;    // G
-        pDest[i + 2] = 0;    // R
-        pDest[i + 3] = 255;  // A
+    if (bufSize == 0) return;
+
+    // Zero all bytes (B=0, G=0, R=0, A=0)
+    memset(pDest, 0, bufSize);
+
+    // Set alpha channel to 0xFF for every pixel (every 4th byte)
+    for (DWORD i = 3; i < bufSize; i += 4) {
+        pDest[i] = 255;
     }
 }
 
@@ -475,5 +481,3 @@ STDAPI DllUnregisterServer() {
 }
 
 extern "C" BOOL WINAPI DllEntryPoint(HINSTANCE, ULONG, LPVOID);
-
-

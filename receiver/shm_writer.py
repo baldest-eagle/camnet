@@ -24,7 +24,6 @@ Dependencies: pywin32, loguru
 from __future__ import annotations
 
 import ctypes
-import mmap
 import struct
 import sys
 import time
@@ -47,16 +46,13 @@ import win32security        # type: ignore[import]
 # ---------------------------------------------------------------------------
 
 MAGIC          = 0xCAFECAFE
-SHM_NAME       = "CamNetFrame"
-MUTEX_NAME     = "CamNetMutex"
+SHM_NAME       = "Global\\CamNetFrame"
+MUTEX_NAME     = "Global\\CamNetMutex"
 MUTEX_TIMEOUT_MS = 100          # skip frame if we can't acquire in 100 ms
 AUDIO_BUF_SIZE = 192_000        # 1 s of 48 kHz stereo s16le = 192 000 bytes
 
 # Struct format for the 40-byte header (little-endian)
-# I I I I Q Q I I
-# magic width height fps frame_index timestamp_ms audio_chunk_size flags
-_HEADER_FMT  = "<IIIIQQIIxxxxxxxx"   # 8 extra padding bytes → total 48 bytes
-# Let's compute a clean layout that matches exactly our offsets spec:
+# Header layout (must match C++ CamNetShmHeader exactly):
 #   0: uint32 magic
 #   4: uint32 width
 #   8: uint32 height
@@ -66,8 +62,9 @@ _HEADER_FMT  = "<IIIIQQIIxxxxxxxx"   # 8 extra padding bytes → total 48 bytes
 #  32: uint32 audio_chunk_size
 #  36: uint32 flags
 #  40: pixels …
-_HEADER_STRUCT = struct.Struct("<IIIIQQIIxxxxxxxx")  # 48 bytes total
-_HEADER_SIZE   = 40    # documented offset of pixels
+_HEADER_FMT    = "<IIIIQQII"
+_HEADER_STRUCT = struct.Struct(_HEADER_FMT)  # 40 bytes — matches C++ #pragma pack(push,1)
+_HEADER_SIZE   = _HEADER_STRUCT.size         # 40
 
 
 def _build_header(
@@ -80,8 +77,7 @@ def _build_header(
     flags: int,
 ) -> bytes:
     """Pack the 40-byte header (struct fields only, no trailing pad)."""
-    return struct.pack(
-        "<IIIIQQii",
+    return _HEADER_STRUCT.pack(
         MAGIC,
         width,
         height,
@@ -126,7 +122,7 @@ class ShmFrameWriter:
 
         self._hmap:  Optional[pywintypes.HANDLEType] = None  # File-mapping handle
         self._mutex: Optional[pywintypes.HANDLEType] = None  # Named mutex handle
-        self._view:  Optional[mmap.mmap]             = None  # mmap view
+        self._view:  Optional[int]                   = None  # MapViewOfFile pointer
 
         self._frame_index: int = 0
 
@@ -153,16 +149,36 @@ class ShmFrameWriter:
         """
         sa = self._build_security_attributes()
 
-        # ---- mmap view (Named Shared Memory) ----
-        # On Windows, mmap.mmap(-1, ...) with a tagname creates/opens
-        # a named file mapping backed by the paging file.
-        self._view = mmap.mmap(
-            -1,
+        # ---- Named File Mapping (Shared Memory) ----
+        # Use CreateFileMappingW with the "Global\" namespace so the
+        # DirectShow filter running in a different session can open it.
+        # Python's mmap.mmap(tagname=...) creates a *session-local* mapping
+        # which the C++ filter (using OpenFileMappingW with "Global\...") cannot see.
+        PAGE_READWRITE = 0x04
+        FILE_MAP_WRITE = 0x02
+        self._hmap = win32file.CreateFileMappingW(
+            win32file.INVALID_HANDLE_VALUE,
+            sa,
+            PAGE_READWRITE,
+            0,
             self._total_size,
-            tagname=SHM_NAME,
-            access=mmap.ACCESS_WRITE,
+            SHM_NAME,
         )
-        self._hmap = self._view  # Satisfy handle checks
+        if not self._hmap or self._hmap == win32file.INVALID_HANDLE_VALUE:
+            raise OSError(f"CreateFileMappingW failed for '{SHM_NAME}'")
+
+        self._view = win32file.MapViewOfFile(
+            self._hmap,
+            FILE_MAP_WRITE,
+            0,
+            0,
+            self._total_size,
+        )
+        if not self._view:
+            win32api.CloseHandle(self._hmap)
+            self._hmap = None
+            raise OSError("MapViewOfFile failed")
+
         logger.info("SHM opened: {} ({} bytes)", SHM_NAME, self._total_size)
 
         # ---- Named mutex ----
@@ -175,7 +191,7 @@ class ShmFrameWriter:
         """Release all handles."""
         if self._view is not None:
             try:
-                self._view.close()
+                win32file.UnmapViewOfFile(self._view)
             except Exception:
                 pass
             self._view = None
@@ -252,16 +268,16 @@ class ShmFrameWriter:
             flags            = flags,
         )
 
-        view = self._view
-        assert view is not None
-
-        view.seek(0)
-        view.write(header)                    # 40 bytes header
-        view.write(bgra_bytes)                # width * height * 4 bytes
+        # Write header + pixels + audio into the mapped memory view.
+        # self._view is a ctypes pointer from MapViewOfFile.
+        buf = (ctypes.c_char * self._total_size).from_address(self._view)
+        offset = 0
+        ctypes.memmove(ctypes.addressof(buf) + offset, header, len(header))
+        offset += len(header)
+        ctypes.memmove(ctypes.addressof(buf) + offset, bgra_bytes, len(bgra_bytes))
+        offset += len(bgra_bytes)
         if audio_sz > 0:
-            view.write(audio_bytes[:audio_sz])  # PCM audio
-
-        view.flush()
+            ctypes.memmove(ctypes.addressof(buf) + offset, audio_bytes, audio_sz)
 
     # ------------------------------------------------------------------
     # Helpers

@@ -7,6 +7,7 @@ retrieve the current shared memory name/offset layout.
 
 Endpoints:
   GET  /status          - Overall receiver health and stream state
+  GET  /health          - Lightweight liveness check (for monitoring)
   GET  /devices         - List discovered CamNet sender devices
   POST /connect         - Connect to a specific sender device
   POST /disconnect      - Disconnect from current stream
@@ -21,7 +22,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from loguru import logger
 
@@ -97,6 +98,11 @@ class ReceiverController:
     def _register_routes(self) -> None:
         app = self._app
 
+        @app.route("/health")
+        def health():
+            """Lightweight liveness probe — returns 200 if the process is alive."""
+            return jsonify({"status": "ok"})
+
         @app.route("/status")
         def status():
             return jsonify({
@@ -125,19 +131,24 @@ class ReceiverController:
 
         @app.route("/devices")
         def devices():
-            # This will be populated by the discovery module
             devices_list = getattr(self, "_devices_list_fn", lambda: [])()
-            return jsonify({"devices": devices_list})
+            return jsonify({"devices": devices_list, "count": len(devices_list)})
 
         @app.route("/connect", methods=["POST"])
         def connect():
             body = request.get_json(silent=True) or {}
             device_name = body.get("device_name", "")
             ip = body.get("ip", "")
-            port = int(body.get("port", 9000))
+            try:
+                port = int(body.get("port", 9000))
+            except (ValueError, TypeError):
+                return jsonify({"error": "port must be an integer"}), 400
 
             if not ip:
                 return jsonify({"error": "ip is required"}), 400
+
+            if not (1 <= port <= 65535):
+                return jsonify({"error": "port must be between 1 and 65535"}), 400
 
             if self._connect_callback:
                 try:
@@ -161,14 +172,12 @@ class ReceiverController:
 
         @app.route("/shm_info")
         def shm_info():
-            """
-            Returns shared memory layout for the DirectShow filter to read.
-
-            The C++ filter calls this once on startup to get the SHM name
-            and understand the binary layout.
-            """
-            w = 1920 if not self.state.resolution else int(self.state.resolution.split("x")[0])
-            h = 1080 if not self.state.resolution else int(self.state.resolution.split("x")[1])
+            """Returns shared memory layout for the DirectShow filter to read."""
+            try:
+                w = 1920 if not self.state.resolution else int(self.state.resolution.split("x")[0])
+                h = 1080 if not self.state.resolution else int(self.state.resolution.split("x")[1])
+            except (ValueError, IndexError):
+                w, h = 1920, 1080
             return jsonify({
                 "shm_name": self.state.shm_name,
                 "mutex_name": self.state.shm_mutex_name,
@@ -196,20 +205,19 @@ class ReceiverController:
         def metrics():
             """Prometheus-style plain text metrics."""
             lines = [
-                f"# HELP camnet_frames_received Total frames received from sender",
-                f"# TYPE camnet_frames_received counter",
+                "# HELP camnet_frames_received Total frames received from sender",
+                "# TYPE camnet_frames_received counter",
                 f"camnet_frames_received {self.state.frames_received}",
-                f"# HELP camnet_frames_dropped Total frames dropped",
-                f"# TYPE camnet_frames_dropped counter",
+                "# HELP camnet_frames_dropped Total frames dropped",
+                "# TYPE camnet_frames_dropped counter",
                 f"camnet_frames_dropped {self.state.frames_dropped}",
-                f"# HELP camnet_latency_ms Current estimated frame latency in milliseconds",
-                f"# TYPE camnet_latency_ms gauge",
+                "# HELP camnet_latency_ms Current estimated frame latency in milliseconds",
+                "# TYPE camnet_latency_ms gauge",
                 f"camnet_latency_ms {self.state.latency_ms:.2f}",
-                f"# HELP camnet_connected 1 if connected to a sender, 0 otherwise",
-                f"# TYPE camnet_connected gauge",
+                "# HELP camnet_connected 1 if connected to a sender, 0 otherwise",
+                "# TYPE camnet_connected gauge",
                 f"camnet_connected {1 if self.state.connected else 0}",
             ]
-            from flask import Response
             return Response("\n".join(lines), mimetype="text/plain")
 
     def set_devices_list_fn(self, fn) -> None:
