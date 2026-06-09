@@ -147,16 +147,45 @@ class SRTStreamer:
         )
 
         if sys.platform == "win32":
-            video_input = [
-                "-f", "dshow",
-                "-video_size", f"{cfg.width}x{cfg.height}",
-                "-framerate", str(cfg.fps),
-                "-i", f"video=@device_idx_{self.device_index}",
-            ]
-            audio_input = [
-                "-f", "dshow",
-                "-i", f"audio=@device_idx_{self.device_index}",
-            ]
+            # Dynamically find DirectShow devices to avoid @device_idx_ syntax issues
+            import subprocess
+            import re
+            
+            try:
+                res = subprocess.run(['ffmpeg', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], stderr=subprocess.PIPE, text=True, encoding='utf-8')
+                v_devs = []
+                a_devs = []
+                for line in res.stderr.split('\n'):
+                    m = re.search(r'\]\s+"([^"]+)"\s+\((video|audio)\)', line)
+                    if m:
+                        if m.group(2) == 'video': v_devs.append(m.group(1))
+                        else: a_devs.append(m.group(1))
+                        
+                video_name = v_devs[self.device_index] if self.device_index < len(v_devs) else v_devs[0] if v_devs else "video=Integrated Camera"
+                audio_name = a_devs[self.device_index] if self.device_index < len(a_devs) else a_devs[0] if a_devs else "audio=Microphone"
+                
+                video_input = [
+                    "-f", "dshow",
+                    "-video_size", f"{cfg.width}x{cfg.height}",
+                    "-framerate", str(cfg.fps),
+                    "-i", f"video={video_name}",
+                ]
+                audio_input = [
+                    "-f", "dshow",
+                    "-i", f"audio={audio_name}",
+                ]
+            except Exception as e:
+                logger.error(f"Failed to enumerate devices, falling back: {e}")
+                video_input = [
+                    "-f", "dshow",
+                    "-video_size", f"{cfg.width}x{cfg.height}",
+                    "-framerate", str(cfg.fps),
+                    "-i", f"video=@device_idx_{self.device_index}",
+                ]
+                audio_input = [
+                    "-f", "dshow",
+                    "-i", f"audio=@device_idx_{self.device_index}",
+                ]
         elif sys.platform == "darwin":
             video_input = [
                 "-f", "avfoundation",
