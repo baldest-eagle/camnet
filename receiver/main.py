@@ -1,11 +1,13 @@
 """
-receiver/main.py — CamNet Receiver entry point (Windows primary PC).
+receiver/main.py — CamNet Receiver entry point (Windows / Linux).
 
 Orchestrates:
 - mDNS discovery of sender devices
 - SRT stream ingest + decode
-- Shared memory writer (feeds DirectShow filter)
-- REST API for driver communication
+- Platform-specific frame output:
+    Windows → Shared memory (DirectShow filter reads it)
+    Linux   → V4L2 loopback device + POSIX SHM mirror
+- REST API for driver / external communication
 - System tray GUI for user control
 """
 
@@ -46,11 +48,13 @@ class CamNetReceiver:
     Top-level orchestrator for the CamNet Receiver.
 
     Lifecycle:
-    1. Start REST controller → DirectShow filter can query /shm_info
+    1. Start REST controller → DirectShow/V4L2 consumer can query /shm_info
     2. Start mDNS discovery → detect sender devices on LAN
     3. Auto-connect to first discovered device (or wait for manual connect)
-    4. Start ingest pipeline → decode SRT stream into SHM
-    5. DirectShow filter reads SHM → OBS sees live video
+    4. Start ingest pipeline → decode SRT stream into frames
+    5. Platform frame writer feeds the virtual camera:
+       - Windows: Shared memory → DirectShow filter → OBS
+       - Linux:   V4L2 loopback device → OBS / any V4L2 app
     """
 
     def __init__(
@@ -61,6 +65,8 @@ class CamNetReceiver:
         height: int = 1080,
         fps: int = 60,
         no_tray: bool = False,
+        v4l2_device: str = "",
+        enable_shm: bool = True,
     ) -> None:
         self.auto_connect = auto_connect
         self.srt_port = srt_port
@@ -68,6 +74,8 @@ class CamNetReceiver:
         self.height = height
         self.fps = fps
         self.no_tray = no_tray
+        self.v4l2_device = v4l2_device
+        self.enable_shm = enable_shm
 
         self._stop_event = threading.Event()
         self._running = False
@@ -76,15 +84,31 @@ class CamNetReceiver:
         from receiver.controller import ReceiverState, ReceiverController
         from receiver.discovery import CamNetDiscovery
         from receiver.ingest import StreamIngestor
-        from receiver.shm_writer import ShmFrameWriter
+        from receiver.platform_shm import create_frame_writer, get_shm_name, get_mutex_name
 
         self._state = ReceiverState()
+        self._state.shm_name = get_shm_name()
+        self._state.shm_mutex_name = get_mutex_name()
+        self._state.platform = sys.platform  # "win32" or "linux"
+
         self._controller = ReceiverController(self._state)
         self._discovery = CamNetDiscovery()
         self._ingestor: StreamIngestor | None = None
-        self._shm_writer: ShmFrameWriter | None = None
-        self._tray = None
 
+        # Platform-specific frame writer (created on start)
+        self._frame_writer = create_frame_writer(
+            width=width,
+            height=height,
+            fps=fps,
+            has_audio=True,
+            device=v4l2_device,
+            enable_shm=enable_shm,
+        )
+
+        # Propagate resolved V4L2 device path to state (for /status endpoint)
+        if sys.platform == "linux" and hasattr(self._frame_writer, "device"):
+            self._state.v4l2_device = self._frame_writer.device
+        self._tray = None
         self._pump_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
@@ -93,20 +117,19 @@ class CamNetReceiver:
 
     def start(self) -> None:
         """Start all receiver components."""
-        logger.info("CamNet Receiver starting...")
+        platform_label = "Windows (DirectShow)" if sys.platform == "win32" else "Linux (V4L2)"
+        logger.info("CamNet Receiver starting [{}]...", platform_label)
         self._state.start_time = time.time()
 
-        # 1. REST API (DirectShow filter needs this immediately)
+        # 1. REST API (DirectShow filter / V4L2 consumer needs this)
         self._controller.on_connect_request(self._handle_connect)
         self._controller.on_disconnect_request(self._handle_disconnect)
         self._controller.set_devices_list_fn(self._get_devices_list)
         self._controller.start()
 
-        # 2. Shared memory (open before discovery so filter can map it)
-        from receiver.shm_writer import ShmFrameWriter
-        self._shm_writer = ShmFrameWriter(width=self.width, height=self.height, fps=self.fps, has_audio=True)
-        self._shm_writer.open()
-        logger.info("Shared memory mapped: {}", self._state.shm_name)
+        # 2. Frame writer (SHM on Windows, V4L2+SHM on Linux)
+        self._frame_writer.open()
+        logger.info("Frame writer opened: {}", self._state.shm_name)
 
         # 3. mDNS discovery
         self._discovery.on_device_found(self._on_device_found)
@@ -116,9 +139,11 @@ class CamNetReceiver:
         self._running = True
         logger.success(
             "CamNet Receiver ready!\n"
+            "  Platform:     {}\n"
             "  REST API:     http://localhost:7432/\n"
             "  Shared Mem:   {}\n"
             "  Waiting for sender devices on LAN...",
+            platform_label,
             self._state.shm_name,
         )
 
@@ -135,8 +160,8 @@ class CamNetReceiver:
 
         self._discovery.stop()
 
-        if self._shm_writer:
-            self._shm_writer.close()
+        if self._frame_writer:
+            self._frame_writer.close()
 
         self._stop_event.set()
         logger.success("CamNet Receiver stopped.")
@@ -185,7 +210,11 @@ class CamNetReceiver:
         from receiver.ingest import StreamIngestor
         logger.info("Connecting to SRT stream at {}:{}...", ip, port)
 
-        self._ingestor = StreamIngestor(ip=ip, port=port, fps=self.fps, has_audio=True)
+        self._ingestor = StreamIngestor(
+            ip=ip, port=port, fps=self.fps,
+            resolution=(self.width, self.height),
+            has_audio=True,
+        )
         self._ingestor.start()
 
         self._state.connected = True
@@ -224,11 +253,11 @@ class CamNetReceiver:
     def _frame_pump_loop(self) -> None:
         """
         Continuously reads decoded frames from the ingestor and writes
-        them into shared memory for the DirectShow filter.
+        them into the platform frame writer (SHM / V4L2).
         """
         logger.info("Frame pump started.")
         ingestor = self._ingestor
-        shm = self._shm_writer
+        writer = self._frame_writer
 
         while self._running and self._state.connected:
             try:
@@ -245,13 +274,16 @@ class CamNetReceiver:
                 except Exception:
                     pass
 
-                # Write to shared memory
+                # Write to platform output
                 write_start = time.perf_counter()
-                shm.write_frame(video_frame, audio_chunk)
+                ok = writer.write_frame(video_frame, audio_chunk)
                 write_ms = (time.perf_counter() - write_start) * 1000
 
-                # Update stats
-                self._state.frames_received += 1
+                # Update stats (only count as received if write succeeded)
+                if ok:
+                    self._state.frames_received += 1
+                else:
+                    self._state.frames_dropped += 1
                 self._state.latency_ms = write_ms
 
                 if self._state.frames_received % 300 == 0:
@@ -366,12 +398,27 @@ class CamNetReceiver:
               help="Target frame rate.")
 @click.option("--no-tray", is_flag=True, default=False,
               help="Disable system tray icon.")
+@click.option("--v4l2-device", default="", show_default="auto-detect",
+              help="[Linux] V4L2 loopback device path (e.g. /dev/video2).")
+@click.option("--enable-shm/--disable-shm", default=True, show_default=True,
+              help="[Linux] Enable POSIX SHM mirror alongside V4L2 output.")
 @click.option("--verbose", "-v", is_flag=True, default=False,
               help="Enable verbose debug logging.")
-def cli(auto_connect: bool, resolution: tuple, fps: int, no_tray: bool, verbose: bool) -> None:
-    """CamNet Receiver — connect a network camera to OBS Studio."""
-    if sys.platform != "win32":
-        logger.error("CamNet Receiver requires Windows (DirectShow/Win32 SHM).")
+def cli(
+    auto_connect: bool,
+    resolution: tuple,
+    fps: int,
+    no_tray: bool,
+    v4l2_device: str,
+    enable_shm: bool,
+    verbose: bool,
+) -> None:
+    """CamNet Receiver — connect a network camera to OBS Studio (Windows / Linux)."""
+    if sys.platform not in ("win32", "linux"):
+        logger.error(
+            "CamNet Receiver requires Windows or Linux. "
+            f"Current platform: {sys.platform}"
+        )
         sys.exit(1)
 
     if verbose:
@@ -379,7 +426,15 @@ def cli(auto_connect: bool, resolution: tuple, fps: int, no_tray: bool, verbose:
         logger.add(sys.stderr, level="DEBUG", colorize=True)
 
     width, height = resolution
-    app = CamNetReceiver(auto_connect=auto_connect, width=width, height=height, fps=fps, no_tray=no_tray)
+    app = CamNetReceiver(
+        auto_connect=auto_connect,
+        width=width,
+        height=height,
+        fps=fps,
+        no_tray=no_tray,
+        v4l2_device=v4l2_device,
+        enable_shm=enable_shm,
+    )
 
     def handle_signal(sig, frame):
         app.stop()

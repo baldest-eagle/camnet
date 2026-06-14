@@ -1,0 +1,31 @@
+# CamNet Receiver — Python Dependencies (Linux)
+# Install: pip install -r requirements_linux.txt
+
+# mDNS / ZeroConf discovery
+zeroconf>=0.132.2
+
+# SRT stream ingest via ffmpeg subprocess (ffmpeg-python wrapper is optional;
+# the StreamIngestor calls ffmpeg directly via subprocess.Popen)
+ffmpeg-python>=0.2.0
+
+# GUI / system tray
+pystray>=0.19.5
+Pillow>=10.3.0
+
+# REST API for driver <-> receiver IPC
+flask>=3.0.3
+flask-cors>=4.0.1
+
+# V4L2 loopback output (no extra Python package needed;
+# uses os.write() and fcntl.ioctl directly via ctypes)
+
+# Utilities
+click>=8.1.7
+loguru>=0.7.2
+psutil>=5.9.8
+requests>=2.32.3
+
+# NOTE: On Linux you also need:
+#   - v4l2loopback kernel module:  sudo modprobe v4l2loopback
+#   - FFmpeg on PATH:              sudo apt install ffmpeg
+#   - See linux_setup.sh for automated setup

@@ -17,6 +17,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -42,8 +43,10 @@ class ReceiverState:
     reconnect_count: int = 0
     latency_ms: float = 0.0
     start_time: float = 0.0
-    shm_name: str = "Global\\CamNetFrame"
-    shm_mutex_name: str = "Global\\CamNetMutex"
+    shm_name: str = ""
+    shm_mutex_name: str = ""
+    platform: str = ""          # "win32" or "linux"
+    v4l2_device: str = ""       # Linux: /dev/videoN path
 
 
 class ReceiverController:
@@ -108,6 +111,7 @@ class ReceiverController:
             return jsonify({
                 "service": "CamNet Receiver",
                 "version": "1.0",
+                "platform": self.state.platform or sys.platform,
                 "connected": self.state.connected,
                 "sender": {
                     "name": self.state.sender_name,
@@ -117,6 +121,7 @@ class ReceiverController:
                     "fps": self.state.fps,
                     "has_audio": self.state.has_audio,
                 } if self.state.connected else None,
+                "v4l2_device": self.state.v4l2_device or None,
                 "stats": {
                     "frames_received": self.state.frames_received,
                     "frames_dropped": self.state.frames_dropped,

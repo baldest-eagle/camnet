@@ -32,7 +32,10 @@ from typing import Optional
 from loguru import logger
 
 if sys.platform != "win32":
-    raise ImportError("shm_writer requires Windows (win32 platform).")
+    raise ImportError(
+        "shm_writer requires Windows (win32 platform). "
+        "On Linux, use receiver.v4l2_output.V4L2LoopbackWriter instead."
+    )
 
 import pywintypes           # type: ignore[import]
 import win32api
@@ -125,6 +128,15 @@ class ShmFrameWriter:
         self._view:  Optional[int]                   = None  # MapViewOfFile pointer
 
         self._frame_index: int = 0
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def frame_index(self) -> int:
+        """Monotonically increasing frame counter (0-based)."""
+        return self._frame_index
 
     # ------------------------------------------------------------------
     # Context manager
